@@ -23,6 +23,7 @@ class Config(pydantic.BaseModel):
     storage_url: str
     upstream_url: str
     versions: typing.List[str]
+    plugins: typing.List[str]
 
 
 class PluginEntry(typing.NamedTuple):
@@ -35,7 +36,11 @@ class PluginSpec(typing.NamedTuple):
     name: str
     description: str
     idea_version: typing.Dict[str, str]
+    dependencies: typing.List[str]
+    optional_dependencies: typing.List[str]
 
+    def __hash__(self):
+        return hash(self.entry.id)
 
 def _escape_path(path) -> str:
     return urllib.parse.quote(path).replace("/", ".")
@@ -174,6 +179,7 @@ class DownloadManager:
         else:
             _log.debug(
                 "Output from %s (exit: %d):\nstdout:\n%s\nstderr:\n%s",
+                url,
                 proc.returncode,
                 proc.stdout.read(),
                 proc.stderr.read(),
@@ -271,6 +277,7 @@ class PluginManager:
 
         for plugin_item in tree.iterfind("//idea-plugin"):
             try:
+                deps = [dep.text for dep in plugin_item.findall("depends")]
                 yield PluginSpec(
                     entry=PluginEntry(
                         id=plugin_item.find("id").text,
@@ -279,14 +286,40 @@ class PluginManager:
                     description=plugin_item.find("description").text,
                     name=plugin_item.find("name").text,
                     idea_version=dict(plugin_item.find("idea-version").attrib),
+                    dependencies=[dep for dep in deps if "(optional)" not in dep],
+                    optional_dependencies=[dep.replace("(optional) ", "") for dep in deps if "(optional)" in dep],
                 )
             except:  # noqa
                 _log.exception("Cannot parse entry %s", plugin_item)
 
-    def download_for(self, build_id: str):
+    def list_plugins_with_dependiencies(self, build_id: str, plugins: typing.List[str], include_optional: bool = False):
+        all_plugin_specs = list(self.list_plugins_for(build_id=build_id))
+
+        if plugins:
+            plugin_specs = set()
+
+            def add_plugin(plugin):
+                for spec in all_plugin_specs:
+                    if spec.entry.id == plugin or spec.name.lower() == plugin.lower():
+                        plugin_specs.add(spec)
+                        for dep in spec.dependencies:
+                            add_plugin(dep)
+                        break
+                else:
+                    if "com.intellij.modules" not in plugin:
+                        _log.warning(f"No plugins matched '{plugin}'")
+
+            for plugin in plugins:
+                add_plugin(plugin)
+                
+            return list(plugin_specs)
+        else:
+            return all_plugin_specs
+
+    def download_for(self, build_id: str, plugins: typing.List[str]):
         processed = []
 
-        for plugin_spec in self.list_plugins_for(build_id=build_id):
+        for plugin_spec in self.list_plugins_with_dependiencies(build_id, plugins):
             _log.debug(
                 "Plugin %s in version %s requested for build %s",
                 plugin_spec.entry.id,
@@ -351,7 +384,7 @@ def main(config_file, log_level):
 
     for build_id in config.versions:
         _log.info("Process plugins for build %s", build_id)
-        pm.download_for(build_id=build_id)
+        pm.download_for(build_id=build_id, plugins=config.plugins)
 
     pm.cleanup_old()
 
